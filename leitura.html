@@ -1,0 +1,146 @@
+// <!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Confinamento Monte Alegre - Leitura de Cocho</title>
+    <style>
+        body { font-family: sans-serif; background-color: #f0f2f5; margin: 0; padding: 0; }
+        .app-header { background: #1b5e20; color: white; padding: 20px; text-align: center; }
+        .logo-img { max-width: 200px; margin-bottom: 10px; display: block; margin-left: auto; margin-right: auto; }
+        
+        .painel-controles { background: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); max-width: 500px; margin: 20px auto; }
+        label { display: block; margin-top: 10px; font-weight: bold; }
+        select, input { width: 100%; padding: 10px; margin-top: 5px; box-sizing: border-box; }
+        
+        .btn-export { background: #20c997; color: white; padding: 15px; border: none; width: 100%; margin-top: 20px; font-weight: bold; cursor: pointer; border-radius: 5px; }
+
+        .mapa-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); gap: 10px; padding: 20px; max-width: 600px; margin: 0 auto; }
+        .curral { background: #fff; border: 2px solid #adb5bd; border-radius: 6px; height: 70px; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; font-size: 12px; font-weight: bold; }
+        
+        .marked-n { background: #ffe3e3; border-color: #fa5252; color: #e03131; }
+        .marked-c { background: #d3f9d8; border-color: #40c057; color: #2b8a3e; }
+        .marked-d { background: #fff3bf; border-color: #fcc419; color: #b08d00; }
+        .marked-i { background: #ffa8a8; border-color: #f03e3e; color: #8c0909; }
+
+        .modal-overlay { display: none; position: fixed; top:0; left:0; width:100%; height:100%; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; }
+        .modal { background: #fff; padding: 20px; border-radius: 8px; width: 80%; max-width: 300px; text-align: center; }
+    </style>
+</head>
+<body>
+
+    <header class="app-header">
+        <img src="logo.png" alt="Logo Empresa" class="logo-img" onerror="this.style.display='none'">
+        <h1>CONFINAMENTO MONTE ALEGRE</h1>
+        <p>Leitura de Cocho</p>
+    </header>
+    
+    <div class="painel-controles">
+        <label>Responsável:</label>
+        <select id="responsavel" onchange="salvarMeta()">
+            <option value="">Selecione...</option>
+            <option>Patricia</option><option>Giovanni</option><option>Caio</option>
+            <option>Rafael</option><option>Pedro</option><option>Silvio</option>
+            <option>Gustavo</option><option>Fabio</option>
+        </select>
+        
+        <label>Horário:</label>
+        <select id="horario" onchange="atualizarMapa()"><option>18h</option><option>20h</option><option>00h</option><option>03h</option><option>06h</option><option>12h</option></select>
+        
+        <label>Linha:</label>
+        <select id="linha" onchange="atualizarMapa()"><option>A</option><option>B</option><option>C</option><option>D</option><option>E</option><option>F</option><option>G</option><option>H</option><option>CIP</option><option>I</option><option>J</option><option>K</option><option>L</option><option>M</option><option>N</option><option>O</option><option>P</option><option>Q</option><option>R</option><option>PST-1</option><option>REP</option></select>
+        
+        <button class="btn-export" onclick="enviarParaNuvem()">📥 Enviar Leitura para Planilha</button>
+    </div>
+
+    <div class="mapa-grid" id="mapa-grid"></div>
+
+    <div class="modal-overlay" id="modal">
+        <div class="modal">
+            <h3 id="modal-title"></h3>
+            <button class="btn" style="background:#40c057; width:100%; padding:10px; border:none; color:white; cursor:pointer;" onclick="salvarLeitura6h('C')">C - CRUMBS</button>
+            <button class="btn" style="background:#fcc419; width:100%; padding:10px; border:none; margin-top:5px; cursor:pointer;" onclick="salvarLeitura6h('D')">D - DRY</button>
+            <button class="btn" style="background:#fa5252; width:100%; padding:10px; border:none; margin-top:5px; color:white; cursor:pointer;" onclick="mostrarInventory()">I - INVENTORY</button>
+            <div id="inv-sec" style="display:none; margin-top:10px;">
+                <input type="number" id="inv-input" placeholder="Qtd">
+                <button class="btn" style="background:#228be6; width:100%; color:white; border:none; margin-top:5px; cursor:pointer;" onclick="salvarInventory()">Confirmar</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const mapa = { 'A': 10, 'B': 14, 'C': 14, 'D': 13, 'E': 10, 'F': 10, 'G': 10, 'H': 10, 'CIP': 8, 'I': 15, 'J': 14, 'K': 16, 'L': 17, 'M': 16, 'N': 4, 'O': 8, 'P': 9, 'Q': 10, 'R': 12, 'PST-1': 2, 'REP': 4 };
+        let dados = JSON.parse(localStorage.getItem('leituraCocho')) || { meta: {resp: ""}, leituras: { '18h': {}, '20h': {}, '00h': {}, '03h': {}, '06h': {}, '12h': {} } };
+        let curralSelecionado = null;
+
+        function salvarMeta() { dados.meta.resp = document.getElementById('responsavel').value; localStorage.setItem('leituraCocho', JSON.stringify(dados)); }
+        
+        function atualizarMapa() {
+            const h = document.getElementById('horario').value;
+            const l = document.getElementById('linha').value;
+            const grid = document.getElementById('mapa-grid');
+            grid.innerHTML = '';
+            for (let i = 1; i <= mapa[l]; i++) {
+                const nome = `${l}-${i}`;
+                const div = document.createElement('div');
+                div.className = 'curral';
+                div.innerHTML = `<span>${nome}</span>`;
+                if(dados.leituras[h][nome]) {
+                    const v = dados.leituras[h][nome];
+                    div.innerHTML += `<span>${v.startsWith('I:') ? v.split(':')[1] : v}</span>`;
+                    if(v==='N') div.classList.add('marked-n'); else if(v==='C') div.classList.add('marked-c'); else if(v==='D') div.classList.add('marked-d'); else div.classList.add('marked-i');
+                }
+                div.onclick = () => { if(h==='06h') { curralSelecionado=nome; document.getElementById('modal').style.display='flex'; } else { dados.leituras[h][nome] = dados.leituras[h][nome] ? null : 'N'; localStorage.setItem('leituraCocho', JSON.stringify(dados)); atualizarMapa(); } };
+                grid.appendChild(div);
+            }
+        }
+
+        function salvarLeitura6h(t) { dados.leituras['06h'][curralSelecionado] = t; localStorage.setItem('leituraCocho', JSON.stringify(dados)); fecharModal(); atualizarMapa(); }
+        function mostrarInventory() { document.getElementById('inv-sec').style.display='block'; }
+        function salvarInventory() { dados.leituras['06h'][curralSelecionado] = 'I:' + document.getElementById('inv-input').value; localStorage.setItem('leituraCocho', JSON.stringify(dados)); fecharModal(); atualizarMapa(); }
+        function fecharModal() { document.getElementById('modal').style.display='none'; document.getElementById('inv-sec').style.display='none'; }
+
+   async function enviarParaNuvem() {
+    const URL_DA_SUA_PLANILHA = "COLE_AQUI_SUA_URL"; 
+    const btn = document.querySelector('.btn-export');
+    btn.innerText = "Enviando...";
+    btn.disabled = true;
+
+    try {
+        for (const h in dados.leituras) {
+            for (const curral in dados.leituras[h]) {
+                let val = dados.leituras[h][curral];
+                if (!val) continue;
+
+                let payload = {
+                    resp: dados.meta.resp,
+                    horario: h,
+                    linha: curral.split('-')[0],
+                    curral: curral,
+                    leitura: val.startsWith('I:') ? 'Inventory' : val,
+                    sobra: val.startsWith('I:') ? val.split(':')[1] : ""
+                };
+                
+                // O uso de 'no-cors' impede que o navegador bloqueie o envio
+                await fetch(URL_DA_SUA_PLANILHA, {
+                    method: "POST",
+                    mode: "no-cors",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                });
+            }
+        }
+        alert("Enviado com sucesso!");
+    } catch (e) {
+        alert("Erro no envio, mas tente ver a planilha. Se não chegar, me avise!");
+    } finally {
+        btn.innerText = "📥 Enviar Leitura para Planilha";
+        btn.disabled = false;
+    }
+}
+
+        document.getElementById('responsavel').value = dados.meta.resp || "";
+        atualizarMapa();
+    </script>
+</body>
+</html>
