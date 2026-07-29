@@ -15,6 +15,8 @@ Onde configurar a conexão:
 """
 
 import os
+import csv
+import io
 from datetime import datetime
 
 import pandas as pd
@@ -49,14 +51,66 @@ def get_engine():
     )
 
 
-LOTE_IMPORTACAO = 1000  # linhas por bloco, pra não estourar o tempo limite do banco
+LOTE_IMPORTACAO = 1000  # linhas por bloco, usado só como fallback (ver _copy_upsert)
+
+
+def _copy_upsert(engine, tabela: str, colunas: list, chaves: list, registros: list, colunas_inteiras: list = None) -> None:
+    """Upsert em massa MUITO mais rápido que INSERT linha a linha: usa o
+    comando COPY do Postgres (o jeito nativo de carregar muitos dados de
+    uma vez) pra jogar tudo numa tabela temporária, e depois um único
+    INSERT ... ON CONFLICT pra gravar de vez. Isso troca "milhares de
+    idas e vindas ao banco" por "uma carga only + um comando só"."""
+    if not registros:
+        return
+    colunas_inteiras = set(colunas_inteiras or [])
+
+    # Se a planilha trouxer linhas duplicadas pra mesma chave (Data+Curral+Lote,
+    # por ex.), o Postgres não aceita atualizar a mesma linha 2x num só
+    # comando — então deduplicamos aqui, mantendo sempre a ÚLTIMA ocorrência
+    # (mesmo comportamento de antes, quando cada linha era gravada uma a uma).
+    dedup = {}
+    for r in registros:
+        chave = tuple(r.get(c) for c in chaves)
+        dedup[chave] = r
+    registros = list(dedup.values())
+
+    cols_sql = ", ".join(f'"{c}"' for c in colunas)
+    update_cols = [c for c in colunas if c not in chaves]
+    update_sql = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
+    chaves_sql = ", ".join(f'"{c}"' for c in chaves)
+
+    def _valor_csv(c, v):
+        if v is None:
+            return ""
+        if c in colunas_inteiras:
+            return str(int(round(v)))
+        return v
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    for r in registros:
+        writer.writerow([_valor_csv(c, r.get(c)) for c in colunas])
+    buffer.seek(0)
+
+    with engine.begin() as conn:
+        dbapi_conn = conn.connection.dbapi_connection
+        cur = dbapi_conn.cursor()
+        cur.execute(f'CREATE TEMP TABLE staging_{tabela} (LIKE "{tabela}") ON COMMIT DROP')
+        cur.copy_expert(
+            f'COPY staging_{tabela} ({cols_sql}) FROM STDIN WITH (FORMAT csv, NULL \'\')',
+            buffer,
+        )
+        cur.execute(
+            f'INSERT INTO "{tabela}" ({cols_sql}) '
+            f'SELECT {cols_sql} FROM staging_{tabela} '
+            f'ON CONFLICT ({chaves_sql}) DO UPDATE SET {update_sql}'
+        )
 
 
 def _executar_em_lotes(engine, sql, registros):
     """Executa um INSERT/UPSERT em blocos pequenos, cada um em sua própria
-    transação — evita estourar o tempo limite do banco em importações
-    grandes (a planilha inteira de uma vez pode ter dezenas de milhares
-    de linhas)."""
+    transação — usado apenas como alternativa mais simples (ex.: notas,
+    que costuma ter poucas linhas). Para grandes volumes, veja _copy_upsert."""
     for inicio in range(0, len(registros), LOTE_IMPORTACAO):
         bloco = registros[inicio:inicio + LOTE_IMPORTACAO]
         with engine.begin() as conn:
@@ -229,14 +283,6 @@ def _log_import(conn, tipo, arquivo_nome, linhas):
 def upsert_ativos(df: pd.DataFrame, arquivo_nome: str = "") -> int:
     """Recebe o DataFrame já normalizado (ver importer.read_ativos) e grava/atualiza no Postgres."""
     engine = get_engine()
-    cols_sql = ", ".join(f'"{c}"' for c in ATIVOS_COLS)
-    placeholders = ", ".join(f":{c}" for c in ATIVOS_COLS)
-    update_cols = [c for c in ATIVOS_COLS if c not in ("DATA", "CURRAL", "LOTE")]
-    update_sql = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
-    sql = text(
-        f'INSERT INTO ativos ({cols_sql}) VALUES ({placeholders}) '
-        f'ON CONFLICT ("DATA", "CURRAL", "LOTE") DO UPDATE SET {update_sql}'
-    )
     registros = []
     for _, r in df.iterrows():
         row = {}
@@ -251,20 +297,15 @@ def upsert_ativos(df: pd.DataFrame, arquivo_nome: str = "") -> int:
     with engine.begin() as conn:
         _log_import(conn, "ATIVOS", arquivo_nome, len(registros))
     if registros:
-        _executar_em_lotes(engine, sql, registros)
+        _copy_upsert(
+            engine, "ativos", ATIVOS_COLS, ["DATA", "CURRAL", "LOTE"], registros,
+            colunas_inteiras=["LOTE", "CAB", "DIAS_CONF", "TIPO_DIAS_RACAO"],
+        )
     return len(registros)
 
 
 def upsert_leitura(df: pd.DataFrame, arquivo_nome: str = "") -> int:
     engine = get_engine()
-    cols_sql = ", ".join(f'"{c}"' for c in LEITURA_COLS)
-    placeholders = ", ".join(f":{c}" for c in LEITURA_COLS)
-    update_cols = [c for c in LEITURA_COLS if c not in ("DATA", "CURRAL")]
-    update_sql = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
-    sql = text(
-        f'INSERT INTO leitura ({cols_sql}) VALUES ({placeholders}) '
-        f'ON CONFLICT ("DATA", "CURRAL") DO UPDATE SET {update_sql}'
-    )
     registros = []
     for _, r in df.iterrows():
         row = {"DATA": _to_date(r.get("DATA"))}
@@ -277,7 +318,7 @@ def upsert_leitura(df: pd.DataFrame, arquivo_nome: str = "") -> int:
     with engine.begin() as conn:
         _log_import(conn, "LEITURA", arquivo_nome, len(registros))
     if registros:
-        _executar_em_lotes(engine, sql, registros)
+        _copy_upsert(engine, "leitura", LEITURA_COLS, ["DATA", "CURRAL"], registros)
     return len(registros)
 
 
