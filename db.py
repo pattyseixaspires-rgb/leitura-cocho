@@ -41,7 +41,26 @@ def get_engine():
             ".streamlit/secrets.toml (local) ou em Settings → Secrets "
             "(Streamlit Community Cloud)."
         )
-    return create_engine(db_url, pool_pre_ping=True, pool_recycle=300)
+    return create_engine(
+        db_url, pool_pre_ping=True, pool_recycle=300,
+        # importações grandes (dezenas de milhares de linhas) podem levar mais
+        # que o padrão do Supabase — pede um limite de tempo maior por comando.
+        connect_args={"options": "-c statement_timeout=120000"},
+    )
+
+
+LOTE_IMPORTACAO = 1000  # linhas por bloco, pra não estourar o tempo limite do banco
+
+
+def _executar_em_lotes(engine, sql, registros):
+    """Executa um INSERT/UPSERT em blocos pequenos, cada um em sua própria
+    transação — evita estourar o tempo limite do banco em importações
+    grandes (a planilha inteira de uma vez pode ter dezenas de milhares
+    de linhas)."""
+    for inicio in range(0, len(registros), LOTE_IMPORTACAO):
+        bloco = registros[inicio:inicio + LOTE_IMPORTACAO]
+        with engine.begin() as conn:
+            conn.execute(sql, bloco)
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +249,9 @@ def upsert_ativos(df: pd.DataFrame, arquivo_nome: str = "") -> int:
             row[c] = v
         registros.append(row)
     with engine.begin() as conn:
-        if registros:
-            conn.execute(sql, registros)
         _log_import(conn, "ATIVOS", arquivo_nome, len(registros))
+    if registros:
+        _executar_em_lotes(engine, sql, registros)
     return len(registros)
 
 
@@ -256,9 +275,9 @@ def upsert_leitura(df: pd.DataFrame, arquivo_nome: str = "") -> int:
             row[c] = v
         registros.append(row)
     with engine.begin() as conn:
-        if registros:
-            conn.execute(sql, registros)
         _log_import(conn, "LEITURA", arquivo_nome, len(registros))
+    if registros:
+        _executar_em_lotes(engine, sql, registros)
     return len(registros)
 
 
@@ -281,9 +300,8 @@ def upsert_notas(df: pd.DataFrame) -> int:
                 v = None
             row[c] = v
         registros.append(row)
-    with engine.begin() as conn:
-        if registros:
-            conn.execute(sql, registros)
+    if registros:
+        _executar_em_lotes(engine, sql, registros)
     return len(registros)
 
 
