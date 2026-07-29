@@ -159,6 +159,49 @@ section[data-testid="stSidebar"] small {{ font-size: 15px !important; }}
 </style>
 """, unsafe_allow_html=True)
 
+
+# ---------------------------------------------------------------------------
+# Senha de acesso (compartilhada pela equipe)
+# ---------------------------------------------------------------------------
+
+def _checar_senha() -> bool:
+    senha_configurada = None
+    try:
+        senha_configurada = st.secrets.get("APP_PASSWORD")
+    except Exception:
+        senha_configurada = None
+
+    if not senha_configurada:
+        # Sem senha configurada em secrets.toml: a tela de login fica desligada.
+        return True
+
+    if st.session_state.get("autenticado"):
+        return True
+
+    def _validar():
+        if st.session_state.get("senha_digitada") == senha_configurada:
+            st.session_state["autenticado"] = True
+        else:
+            st.session_state["autenticado"] = False
+
+    st.markdown(
+        f'<div class="header-title-wrap" style="background:{TEAL_DARK}; padding:24px; '
+        f'border-radius:14px; max-width:420px; margin:60px auto 20px auto; text-align:center;">'
+        f'<h1 style="font-size:28px;">🐂 Manejo de Cocho</h1>'
+        f'<span style="font-size:16px;">Acesso restrito à equipe</span></div>',
+        unsafe_allow_html=True,
+    )
+    col_a, col_b, col_c = st.columns([1, 1, 1])
+    with col_b:
+        st.text_input("Senha de acesso", type="password", key="senha_digitada", on_change=_validar)
+        if st.session_state.get("autenticado") is False:
+            st.error("Senha incorreta. Tente de novo.")
+    return False
+
+
+if not _checar_senha():
+    st.stop()
+
 db.init_db()
 
 # ---------------------------------------------------------------------------
@@ -170,6 +213,28 @@ st.sidebar.markdown("### 📥 Importar planilhas do dia")
 
 up_ativos = st.sidebar.file_uploader("Planilha de Consumo (aba Ativos)", type=["xlsx"], key="up_ativos")
 up_leitura = st.sidebar.file_uploader("Planilha de Leitura de Cocho (aba Leitura)", type=["xlsx"], key="up_leitura")
+
+with st.sidebar.expander("🔗 Ou importar Leitura direto do Google Sheets"):
+    st.caption(
+        "A planilha precisa estar compartilhada como "
+        "'Qualquer pessoa com o link pode visualizar'."
+    )
+    link_google_leitura = st.text_input(
+        "Link da planilha (Google Sheets)", key="link_google_leitura",
+        placeholder="Cole aqui o link de compartilhamento",
+    )
+    if st.button("🔄 Importar do Google Sheets", key="btn_google_leitura", width="stretch"):
+        if not link_google_leitura:
+            st.warning("Cole o link da planilha antes de importar.")
+        else:
+            try:
+                arquivo = importer.baixar_google_sheet(link_google_leitura)
+                df_l = importer.read_leitura(arquivo)
+                n = db.upsert_leitura(df_l, "Google Sheets")
+                st.success(f"Leitura: {n} linhas importadas do Google Sheets.")
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"Erro ao importar do Google Sheets: {e}")
 
 col_a, col_b = st.sidebar.columns(2)
 if col_a.button("✅ Processar", width="stretch"):

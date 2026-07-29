@@ -10,12 +10,39 @@ em branco — não quebra a importação.
 
 import pandas as pd
 import re
+import io
+import requests
 
 from db import ATIVOS_COLS, LEITURA_COLS
 
 
 def _norm_col(c):
     return re.sub(r"\s+", " ", str(c).strip())
+
+
+def extrair_sheet_id(url_ou_id: str) -> str:
+    """Aceita tanto o ID puro da planilha quanto a URL completa do Google Sheets."""
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url_ou_id)
+    if m:
+        return m.group(1)
+    return url_ou_id.strip()
+
+
+def baixar_google_sheet(url_ou_id: str):
+    """Baixa uma planilha do Google Sheets (compartilhada como 'Qualquer pessoa
+    com o link pode visualizar') e devolve um arquivo em memória (.xlsx),
+    pronto para passar direto pra read_ativos()/read_leitura()."""
+    sheet_id = extrair_sheet_id(url_ou_id)
+    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    resp = requests.get(export_url, timeout=30)
+    resp.raise_for_status()
+    if resp.content[:200].lstrip()[:15].lower().startswith(b"<!doctype html") or b"<html" in resp.content[:300].lower():
+        raise ValueError(
+            "Não consegui baixar a planilha do Google Sheets. Confirme que o "
+            "compartilhamento está como 'Qualquer pessoa com o link pode "
+            "visualizar' (Compartilhar → Acesso geral)."
+        )
+    return io.BytesIO(resp.content)
 
 
 def _find_ativos_sheet(sheets: dict):
