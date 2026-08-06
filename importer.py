@@ -20,6 +20,24 @@ def _norm_col(c):
     return re.sub(r"\s+", " ", str(c).strip())
 
 
+def normalizar_curral(nome):
+    """Padroniza o nome do curral pra sempre ficar no mesmo formato, com
+    hífen entre a letra e o número — ex.: 'A10' e 'A-10' são o mesmo curral
+    físico (uma planilha escreve com hífen, outra sem), então os dois viram
+    'A-10'. Sem isso, o app trataria como dois currais diferentes e a
+    Leitura de um nunca apareceria junto com o Consumo do outro."""
+    if nome is None:
+        return nome
+    nome = str(nome).strip()
+    if not nome:
+        return nome
+    m = re.match(r"^([A-Za-zÀ-ÿ]+)[\s\-]*(\d+)(.*)$", nome)
+    if m:
+        prefixo, numero, resto = m.groups()
+        return f"{prefixo}-{numero}{resto}"
+    return nome
+
+
 def extrair_sheet_id(url_ou_id: str) -> str:
     """Aceita tanto o ID puro da planilha quanto a URL completa do Google Sheets."""
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url_ou_id)
@@ -82,7 +100,7 @@ def read_ativos(file) -> pd.DataFrame:
 
     out = pd.DataFrame()
     out["DATA"] = pd.to_datetime(col("DATA", "Data"), errors="coerce")
-    out["CURRAL"] = col("CURRAL", "Curral")
+    out["CURRAL"] = col("CURRAL", "Curral").apply(normalizar_curral)
     out["LOTE"] = pd.to_numeric(col("LOTE", "Lote"), errors="coerce")
     out["CAB"] = pd.to_numeric(col("CAB", "QtdAnimais"), errors="coerce")
     out["RACA"] = col("RACA", "Raça", "Raca")
@@ -159,7 +177,7 @@ def read_leitura(file) -> pd.DataFrame:
 
     out = pd.DataFrame()
     out["DATA"] = pd.to_datetime(col("DATA DIURNA", "DATA"), errors="coerce")
-    out["CURRAL"] = col("CURRAL")
+    out["CURRAL"] = col("CURRAL").apply(normalizar_curral)
     out["H18"] = col("18 HORAS", "18H")
     out["H20"] = col("20 HORAS", "20H")
     out["H00"] = col("00 HORAS", "00H")
@@ -171,3 +189,31 @@ def read_leitura(file) -> pd.DataFrame:
 
     out = out.dropna(subset=["DATA", "CURRAL"])
     return out[LEITURA_COLS]
+
+
+def read_decisoes_historico(file) -> pd.DataFrame:
+    """Lê uma planilha com histórico de Decisões antigas (colunas DATA,
+    CURRAL, LOTE, DECISÃO). O valor de 'DECISÃO' nessas planilhas costuma
+    ser o valor-alvo do dia (não o ajuste +/- que o app usa) — a conversão
+    pra ajuste é feita depois, em db.importar_decisoes_historico."""
+    sheets = pd.read_excel(file, sheet_name=None)
+    raw = list(sheets.values())[0]
+    raw.columns = [_norm_col(c) for c in raw.columns]
+    colmap = {c.upper(): c for c in raw.columns}
+
+    def col(*nomes):
+        for n in nomes:
+            chave = n.upper()
+            if chave in colmap:
+                return raw[colmap[chave]]
+        return pd.Series([None] * len(raw))
+
+    out = pd.DataFrame()
+    out["DATA"] = pd.to_datetime(col("DATA"), errors="coerce")
+    out["CURRAL"] = col("CURRAL").apply(normalizar_curral)
+    out["LOTE"] = pd.to_numeric(col("LOTE"), errors="coerce")
+    out["DECISAO_ALVO"] = pd.to_numeric(col("DECISÃO", "DECISAO"), errors="coerce")
+
+    out = out.dropna(subset=["DATA", "CURRAL", "LOTE", "DECISAO_ALVO"])
+    out["LOTE"] = out["LOTE"].astype(int)
+    return out

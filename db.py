@@ -6,22 +6,45 @@ de consumo e leituras de cocho fique acessível de qualquer lugar, com
 várias pessoas usando o app ao mesmo tempo — inclusive quando o app está
 hospedado no Streamlit Community Cloud.
 
-Onde configurar a conexão:
-  - Rodando localmente: crie o arquivo `.streamlit/secrets.toml` (na mesma
-    pasta do app.py) com:
-        SUPABASE_DB_URL = "postgresql://postgres:SENHA@HOST:5432/postgres"
-  - Rodando no Streamlit Community Cloud: cole a mesma linha em
-    "Settings" → "Secrets" do seu app, pelo site share.streamlit.io.
+Onde configurar a conexão — duas formas, escolha uma:
+
+  FORMA 1 (recomendada — evita erro de senha com caracteres especiais):
+  no arquivo `.streamlit/secrets.toml` (local) ou em Settings → Secrets
+  (Streamlit Community Cloud), separe os dados da conexão em campos:
+
+        SUPABASE_HOST = "aws-0-sa-east-1.pooler.supabase.com"
+        SUPABASE_PORT = 5432
+        SUPABASE_USER = "postgres.xxxxxxxxxxxx"
+        SUPABASE_PASSWORD = "sua-senha-aqui-sem-precisar-mexer-em-nada"
+        SUPABASE_DBNAME = "postgres"
+
+  Pode colar a senha exatamente como o Supabase mostrou, com @, #, ou
+  qualquer caractere especial — o app monta a conexão sozinho e cuida da
+  parte técnica de "escapar" esses caracteres.
+
+  FORMA 2 (avançado): uma única linha com a string de conexão completa
+  (nesse caso, VOCÊ precisa codificar manualmente caracteres especiais da
+  senha, ex.: @ vira %40, # vira %23):
+
+        SUPABASE_DB_URL = "postgresql://postgres:SENHA_CODIFICADA@HOST:5432/postgres"
 """
 
 import os
 import csv
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
+
+
+def _pegar_secret(nome, default=None):
+    try:
+        return st.secrets.get(nome, default)
+    except Exception:
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -30,16 +53,30 @@ from sqlalchemy import create_engine, text
 
 @st.cache_resource(show_spinner=False)
 def get_engine():
+    # Forma 1 (recomendada): campos separados — a senha pode ter @, #, etc.
+    # sem precisar de nenhuma codificação manual, porque o SQLAlchemy monta
+    # a URL de conexão sozinho e escapa esses caracteres corretamente.
+    host = _pegar_secret("SUPABASE_HOST")
+    senha = _pegar_secret("SUPABASE_PASSWORD")
     db_url = None
-    try:
-        db_url = st.secrets.get("SUPABASE_DB_URL")
-    except Exception:
-        db_url = None
-    if not db_url:
-        db_url = os.environ.get("DATABASE_URL")
+    if host and senha:
+        usuario = _pegar_secret("SUPABASE_USER", "postgres")
+        porta = int(_pegar_secret("SUPABASE_PORT", 5432))
+        nome_banco = _pegar_secret("SUPABASE_DBNAME", "postgres")
+        db_url = URL.create(
+            "postgresql+psycopg2",
+            username=usuario, password=senha,
+            host=host, port=porta, database=nome_banco,
+        )
+
+    # Forma 2: string de conexão completa, já pronta (modo avançado).
+    if db_url is None:
+        db_url = _pegar_secret("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
+
     if not db_url:
         raise RuntimeError(
-            "Não achei a conexão com o banco. Defina SUPABASE_DB_URL em "
+            "Não achei a conexão com o banco. Defina SUPABASE_HOST + "
+            "SUPABASE_PASSWORD (recomendado) ou SUPABASE_DB_URL em "
             ".streamlit/secrets.toml (local) ou em Settings → Secrets "
             "(Streamlit Community Cloud)."
         )
@@ -49,6 +86,7 @@ def get_engine():
         # que o padrão do Supabase — pede um limite de tempo maior por comando.
         connect_args={"options": "-c statement_timeout=120000"},
     )
+
 
 
 LOTE_IMPORTACAO = 1000  # linhas por bloco, usado só como fallback (ver _copy_upsert)
@@ -148,6 +186,7 @@ CREATE TABLE IF NOT EXISTS ativos (
     "LEITURA1" DOUBLE PRECISION,
     "LEITURA2" DOUBLE PRECISION,
     "LEITURA3" DOUBLE PRECISION,
+    "_IMPORT_ID" INTEGER,
     PRIMARY KEY ("DATA", "CURRAL", "LOTE")
 );
 
@@ -162,6 +201,7 @@ CREATE TABLE IF NOT EXISTS leitura (
     "SOBRA" DOUBLE PRECISION,
     "H12" TEXT,
     "H16" TEXT,
+    "_IMPORT_ID" INTEGER,
     PRIMARY KEY ("DATA", "CURRAL")
 );
 
@@ -216,7 +256,10 @@ def init_db():
 
 def _migrate():
     """Adiciona colunas novas em bases já existentes, sem apagar nada."""
-    novas_colunas = {"ativos": [("CONSUMO_MN", "DOUBLE PRECISION")], "leitura": [("H16", "TEXT")]}
+    novas_colunas = {
+        "ativos": [("CONSUMO_MN", "DOUBLE PRECISION"), ("_IMPORT_ID", "INTEGER")],
+        "leitura": [("H16", "TEXT"), ("_IMPORT_ID", "INTEGER")],
+    }
     engine = get_engine()
     with engine.begin() as conn:
         for tabela, colunas in novas_colunas.items():
@@ -268,16 +311,17 @@ def _clean(v):
 
 
 def _log_import(conn, tipo, arquivo_nome, linhas):
-    conn.execute(
+    resultado = conn.execute(
         text(
             'INSERT INTO import_log (tipo, arquivo, linhas, importado_em) '
-            'VALUES (:tipo, :arquivo, :linhas, :importado_em)'
+            'VALUES (:tipo, :arquivo, :linhas, :importado_em) RETURNING id'
         ),
         {
             "tipo": tipo, "arquivo": arquivo_nome, "linhas": linhas,
             "importado_em": datetime.now().isoformat(timespec="seconds"),
         },
     )
+    return resultado.scalar()
 
 
 def upsert_ativos(df: pd.DataFrame, arquivo_nome: str = "") -> int:
@@ -295,28 +339,100 @@ def upsert_ativos(df: pd.DataFrame, arquivo_nome: str = "") -> int:
             row[c] = v
         registros.append(row)
     with engine.begin() as conn:
-        _log_import(conn, "ATIVOS", arquivo_nome, len(registros))
+        import_id = _log_import(conn, "ATIVOS", arquivo_nome, len(registros))
+    for r in registros:
+        r["_IMPORT_ID"] = import_id
     if registros:
         _copy_upsert(
-            engine, "ativos", ATIVOS_COLS, ["DATA", "CURRAL", "LOTE"], registros,
-            colunas_inteiras=["LOTE", "CAB", "DIAS_CONF", "TIPO_DIAS_RACAO"],
+            engine, "ativos", ATIVOS_COLS + ["_IMPORT_ID"], ["DATA", "CURRAL", "LOTE"], registros,
+            colunas_inteiras=["LOTE", "CAB", "DIAS_CONF", "TIPO_DIAS_RACAO", "_IMPORT_ID"],
         )
     return len(registros)
 
 
 def upsert_leitura(df: pd.DataFrame, arquivo_nome: str = "") -> int:
+    """As leituras das 12h e 16h que vêm na planilha do dia D na verdade se
+    referem ao trato do dia ANTERIOR (D-1) — a planilha só registra elas
+    "atrasadas", já no arquivo do dia seguinte. Por isso são gravadas com um
+    dia a menos, separadas do resto da leitura (18h/20h/00h/03h/06h/Sobra),
+    que continua no dia D normalmente."""
+    engine = get_engine()
+    registros_principais = []
+    registros_12_16h = []
+    for _, r in df.iterrows():
+        data_r = _to_date(r.get("DATA"))
+        curral_r = r.get("CURRAL")
+
+        row_principal = {"DATA": data_r, "CURRAL": curral_r}
+        for c in ["H18", "H20", "H00", "H03", "H06", "SOBRA"]:
+            v = r.get(c)
+            if isinstance(v, float) and pd.isna(v):
+                v = None
+            row_principal[c] = v
+        registros_principais.append(row_principal)
+
+        h12 = r.get("H12")
+        h16 = r.get("H16")
+        h12 = None if isinstance(h12, float) and pd.isna(h12) else h12
+        h16 = None if isinstance(h16, float) and pd.isna(h16) else h16
+        if (h12 is not None or h16 is not None) and data_r is not None:
+            registros_12_16h.append({
+                "DATA": data_r - timedelta(days=1), "CURRAL": curral_r, "H12": h12, "H16": h16,
+            })
+
+    with engine.begin() as conn:
+        import_id = _log_import(conn, "LEITURA", arquivo_nome, len(registros_principais))
+    for r in registros_principais:
+        r["_IMPORT_ID"] = import_id
+
+    if registros_principais:
+        _copy_upsert(
+            engine, "leitura",
+            ["DATA", "CURRAL", "H18", "H20", "H00", "H03", "H06", "SOBRA", "_IMPORT_ID"],
+            ["DATA", "CURRAL"], registros_principais,
+            colunas_inteiras=["_IMPORT_ID"],
+        )
+    if registros_12_16h:
+        _copy_upsert(
+            engine, "leitura", ["DATA", "CURRAL", "H12", "H16"], ["DATA", "CURRAL"], registros_12_16h,
+        )
+    return len(registros_principais)
+
+
+def excluir_importacao(import_id: int) -> dict:
+    """Remove as linhas gravadas por uma importação específica (identificada
+    pelo id do log) e o próprio registro do log.
+
+    Atenção: se alguma dessas linhas foi sobrescrita por uma importação MAIS
+    RECENTE depois, ela já não pertence mais a esta importação (o
+    _IMPORT_ID dela já foi atualizado) — então excluir uma importação antiga
+    não desfaz o que uma importação nova sobrescreveu por cima dela."""
+    engine = get_engine()
+    resultado = {"ativos": 0, "leitura": 0}
+    with engine.begin() as conn:
+        r1 = conn.execute(text('DELETE FROM ativos WHERE "_IMPORT_ID" = :id'), {"id": import_id})
+        resultado["ativos"] = r1.rowcount
+        r2 = conn.execute(text('DELETE FROM leitura WHERE "_IMPORT_ID" = :id'), {"id": import_id})
+        resultado["leitura"] = r2.rowcount
+        conn.execute(text("DELETE FROM import_log WHERE id = :id"), {"id": import_id})
+    return resultado
+
+
+def upsert_leitura_manual(df: pd.DataFrame) -> int:
+    """Grava correções manuais de Leitura direto na data mostrada na tela
+    (SEM o deslocamento de 12h/16h pro dia anterior — esse deslocamento só
+    faz sentido interpretando uma planilha nova; aqui o usuário já está
+    editando o valor que aparece armazenado no dia certo)."""
     engine = get_engine()
     registros = []
     for _, r in df.iterrows():
-        row = {"DATA": _to_date(r.get("DATA"))}
-        for c in LEITURA_COLS[1:]:
+        row = {"DATA": _to_date(r.get("DATA")), "CURRAL": r.get("CURRAL")}
+        for c in LEITURA_COLS[2:]:
             v = r.get(c)
             if isinstance(v, float) and pd.isna(v):
                 v = None
             row[c] = v
         registros.append(row)
-    with engine.begin() as conn:
-        _log_import(conn, "LEITURA", arquivo_nome, len(registros))
     if registros:
         _copy_upsert(engine, "leitura", LEITURA_COLS, ["DATA", "CURRAL"], registros)
     return len(registros)
@@ -350,28 +466,82 @@ def upsert_notas(df: pd.DataFrame) -> int:
 # Leitura (SELECT)
 # ---------------------------------------------------------------------------
 
-def load_all_ativos() -> pd.DataFrame:
+JANELA_PADRAO_DIAS = 210  # ~7 meses — cobre o ciclo normal de confinamento;
+                          # dados mais antigos só são buscados quando
+                          # realmente pedidos (ver load_historico_completo_lote)
+
+
+@st.cache_data(ttl=1800, show_spinner="Carregando histórico de Consumo...")
+def load_all_ativos(dias: int = JANELA_PADRAO_DIAS) -> pd.DataFrame:
+    """Carrega o Consumo dos últimos `dias` dias (não a tabela inteira desde
+    o começo) — isso reduz bastante o tráfego de dados trocado com o banco
+    (importante pro limite de egress do plano gratuito do Supabase). Pra
+    pegar o histórico completo de um lote específico, use
+    load_historico_completo_lote()."""
     engine = get_engine()
-    df = pd.read_sql_query(text('SELECT * FROM ativos'), engine)
+    query = 'SELECT * FROM ativos'
+    params = {}
+    if dias:
+        query += ' WHERE "DATA" >= (CURRENT_DATE - :dias * INTERVAL \'1 day\')'
+        params["dias"] = dias
+    df = pd.read_sql_query(text(query), engine, params=params)
     if not df.empty:
         df["DATA"] = pd.to_datetime(df["DATA"])
         df["DATA_ENTRADA"] = pd.to_datetime(df["DATA_ENTRADA"])
     return df
 
 
-def load_all_leitura() -> pd.DataFrame:
+@st.cache_data(ttl=1800, show_spinner="Carregando histórico de Leitura...")
+def load_all_leitura(dias: int = JANELA_PADRAO_DIAS) -> pd.DataFrame:
     engine = get_engine()
-    df = pd.read_sql_query(text('SELECT * FROM leitura'), engine)
+    query = 'SELECT * FROM leitura'
+    params = {}
+    if dias:
+        query += ' WHERE "DATA" >= (CURRENT_DATE - :dias * INTERVAL \'1 day\')'
+        params["dias"] = dias
+    df = pd.read_sql_query(text(query), engine, params=params)
     if not df.empty:
         df["DATA"] = pd.to_datetime(df["DATA"])
     return df
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_historico_completo_lote(curral: str, lote: int) -> pd.DataFrame:
+    """Busca TODO o histórico (sem limite de data) de um curral/lote
+    específico — uma consulta pequena e direcionada, usada só quando
+    realmente precisa (ex.: período 'Tudo' selecionado, ou a conta de
+    Sem/Com Limpeza que procura o %MS da dieta em qualquer data antiga).
+    Bem mais barata em tráfego do que carregar a tabela inteira."""
+    engine = get_engine()
+    df = pd.read_sql_query(
+        text('SELECT * FROM ativos WHERE "CURRAL" = :curral AND "LOTE" = :lote ORDER BY "DATA"'),
+        engine, params={"curral": curral, "lote": int(lote)},
+    )
+    if not df.empty:
+        df["DATA"] = pd.to_datetime(df["DATA"])
+        df["DATA_ENTRADA"] = pd.to_datetime(df["DATA_ENTRADA"])
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_notas(curral: str) -> pd.DataFrame:
     engine = get_engine()
     df = pd.read_sql_query(
         text('SELECT * FROM notas WHERE "CURRAL" = :curral'), engine, params={"curral": curral},
     )
+    if not df.empty:
+        df["DATA"] = pd.to_datetime(df["DATA"])
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner="Carregando notas/ocorrências...")
+def load_all_notas() -> pd.DataFrame:
+    """Carrega a tabela notas inteira de uma vez (todos os currais). Usar
+    essa versão + filtrar em pandas é bem mais rápido do que chamar
+    load_notas(curral) toda vez que o curral selecionado muda — evita uma
+    ida ao banco por clique."""
+    engine = get_engine()
+    df = pd.read_sql_query(text('SELECT * FROM notas'), engine)
     if not df.empty:
         df["DATA"] = pd.to_datetime(df["DATA"])
     return df
@@ -398,6 +568,78 @@ def set_setting(key: str, value):
         )
 
 
+def normalizar_currais_existentes() -> dict:
+    """Corrige, nos dados que já estão gravados, os currais que ficaram com
+    nomes inconsistentes (ex.: 'A10' numa planilha e 'A-10' na outra —
+    mesmo curral físico, grafias diferentes). Reúne as duas grafias numa
+    só, mesclando os dados (se houver linha na mesma data/lote nas duas
+    grafias, a mais recente/completa fica). Roda nas tabelas ativos,
+    leitura, notas e decisoes."""
+    import importer as _importer  # import local pra evitar ciclo de import
+    engine = get_engine()
+    resultado = {"ativos": 0, "leitura": 0, "notas": 0, "decisoes": 0}
+
+    especificacoes = [
+        ("ativos", ["DATA", "CURRAL", "LOTE"] + [c for c in ATIVOS_COLS if c not in ("DATA", "CURRAL", "LOTE")]),
+        ("leitura", LEITURA_COLS),
+        ("notas", NOTAS_COLS),
+        ("decisoes", ["DATA", "CURRAL", "LOTE", "DECISAO", "registrado_em"]),
+    ]
+
+    for tabela, colunas in especificacoes:
+        df = pd.read_sql_query(text(f'SELECT * FROM {tabela}'), engine)
+        if df.empty:
+            continue
+        df["_NORMALIZADO"] = df["CURRAL"].apply(_importer.normalizar_curral)
+        mudou = df[df["_NORMALIZADO"] != df["CURRAL"]].copy()
+        if mudou.empty:
+            continue
+        currais_antigos = mudou["CURRAL"].unique().tolist()
+        mudou["CURRAL"] = mudou["_NORMALIZADO"]
+        mudou = mudou.drop(columns=["_NORMALIZADO"])
+
+        chaves = ["DATA", "CURRAL", "LOTE"] if "LOTE" in colunas else ["DATA", "CURRAL"]
+        registros = mudou[colunas].to_dict("records")
+        colunas_inteiras = ["LOTE"] if "LOTE" in colunas else []
+        _copy_upsert(engine, tabela, colunas, chaves, registros, colunas_inteiras=colunas_inteiras)
+
+        with engine.begin() as conn:
+            for antigo in currais_antigos:
+                conn.execute(text(f'DELETE FROM {tabela} WHERE "CURRAL" = :antigo'), {"antigo": antigo})
+
+        resultado[tabela] = len(mudou)
+
+    return resultado
+
+
+def limpar_h12_h16_periodo(data_inicio_iso: str, data_fim_iso: str) -> int:
+    """Zera as colunas H12/H16 de todos os currais num intervalo de datas —
+    usado pra limpar valores gravados incorretamente antes da correção do
+    'deslocamento de 1 dia' (ver upsert_leitura), permitindo reimportar as
+    planilhas desse período e deixar tudo no lugar certo."""
+    engine = get_engine()
+    with engine.begin() as conn:
+        resultado = conn.execute(
+            text(
+                'UPDATE leitura SET "H12" = NULL, "H16" = NULL '
+                'WHERE "DATA" BETWEEN :inicio AND :fim'
+            ),
+            {"inicio": _to_date(data_inicio_iso), "fim": _to_date(data_fim_iso)},
+        )
+        return resultado.rowcount
+
+
+def excluir_decisoes_por_data(data_iso: str) -> int:
+    """Apaga TODAS as decisões registradas numa data específica (em todos os
+    currais/lotes) — útil pra limpar decisões de teste."""
+    engine = get_engine()
+    with engine.begin() as conn:
+        resultado = conn.execute(
+            text('DELETE FROM decisoes WHERE "DATA" = :data'), {"data": _to_date(data_iso)}
+        )
+        return resultado.rowcount
+
+
 def upsert_decisao(data_iso: str, curral: str, lote: int, decisao):
     """decisao: ajuste em Kg MS/cab (número, ex.: 0.3 ou -0.2)."""
     engine = get_engine()
@@ -417,6 +659,49 @@ def upsert_decisao(data_iso: str, curral: str, lote: int, decisao):
         )
 
 
+def importar_decisoes_historico(df: pd.DataFrame) -> dict:
+    """Recebe um DataFrame com DATA, CURRAL, LOTE, DECISAO_ALVO (ver
+    importer.read_decisoes_historico) e grava no formato que o app usa
+    (ajuste = alvo do dia − CMS real do dia anterior), buscando o CMS de
+    cada linha na própria tabela ativos. Linhas sem CMS do dia anterior
+    disponível são puladas (não dá pra calcular o ajuste sem isso)."""
+    engine = get_engine()
+    ativos = load_all_ativos()
+    if ativos.empty:
+        return {"gravadas": 0, "puladas": len(df)}
+
+    cms_por_chave = ativos.set_index(["CURRAL", "LOTE", "DATA"])["CONSUMO_MS"]
+
+    registros = []
+    puladas = 0
+    for _, r in df.iterrows():
+        data_ant = r["DATA"] - pd.Timedelta(days=1)
+        try:
+            cms_ant = cms_por_chave.loc[(r["CURRAL"], int(r["LOTE"]), data_ant)]
+        except KeyError:
+            cms_ant = None
+        if cms_ant is None or pd.isna(cms_ant):
+            puladas += 1
+            continue
+        registros.append({
+            "DATA": _to_date(r["DATA"]),
+            "CURRAL": r["CURRAL"],
+            "LOTE": int(r["LOTE"]),
+            "DECISAO": float(r["DECISAO_ALVO"]) - float(cms_ant),
+            "registrado_em": datetime.now().isoformat(timespec="seconds"),
+        })
+
+    if registros:
+        _copy_upsert(
+            engine, "decisoes",
+            ["DATA", "CURRAL", "LOTE", "DECISAO", "registrado_em"],
+            ["DATA", "CURRAL", "LOTE"],
+            registros, colunas_inteiras=["LOTE"],
+        )
+    return {"gravadas": len(registros), "puladas": puladas}
+
+
+
 def _add_consumo_previsto(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         df["CONSUMO_DIA"] = []
@@ -428,6 +713,42 @@ def _add_consumo_previsto(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=1800, show_spinner="Carregando decisões...")
+def load_all_decisoes_raw() -> pd.DataFrame:
+    """Carrega só a tabela decisoes (sem o JOIN caro com ativos), de uma vez
+    só, pra todos os currais/lotes. Combine com calcular_consumo_previsto_local
+    (usando o ativos que o app já tem carregado em memória) pra evitar tanto
+    o JOIN no banco quanto uma ida ao banco por curral clicado."""
+    engine = get_engine()
+    df = pd.read_sql_query(
+        text('SELECT "DATA", "CURRAL", "LOTE", "DECISAO" FROM decisoes ORDER BY "DATA" DESC'),
+        engine,
+    )
+    if not df.empty:
+        df["DATA"] = pd.to_datetime(df["DATA"])
+        df["DECISAO"] = pd.to_numeric(df["DECISAO"], errors="coerce")
+    return df
+
+
+def calcular_consumo_previsto_local(decisoes_df: pd.DataFrame, ativos_df: pd.DataFrame) -> pd.DataFrame:
+    """Calcula Consumo do Dia Anterior e Consumo Previsto inteiramente em
+    pandas (sem ida ao banco), usando o ativos que já está em memória —
+    substitui o JOIN em SQL feito por load_decisoes/load_all_decisoes."""
+    d = decisoes_df.copy()
+    if d.empty:
+        d["CONSUMO_DIA"] = pd.Series(dtype=float)
+        d["CONSUMO_PREVISTO"] = pd.Series(dtype=float)
+        return d
+    d["_DATA_ANTERIOR"] = d["DATA"] - pd.Timedelta(days=1)
+    base = ativos_df[["DATA", "CURRAL", "LOTE", "CONSUMO_MS"]].rename(
+        columns={"DATA": "_DATA_ANTERIOR", "CONSUMO_MS": "CONSUMO_DIA"}
+    )
+    d = d.merge(base, on=["_DATA_ANTERIOR", "CURRAL", "LOTE"], how="left")
+    d["CONSUMO_PREVISTO"] = d["CONSUMO_DIA"] + d["DECISAO"]
+    return d.drop(columns=["_DATA_ANTERIOR"])
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_decisoes(curral: str = None, lote: int = None) -> pd.DataFrame:
     engine = get_engine()
     query = (
@@ -452,6 +773,7 @@ def load_decisoes(curral: str = None, lote: int = None) -> pd.DataFrame:
     return _add_consumo_previsto(df)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_all_decisoes() -> pd.DataFrame:
     engine = get_engine()
     query = (
