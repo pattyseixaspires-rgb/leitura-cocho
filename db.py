@@ -32,12 +32,14 @@ Onde configurar a conexão — duas formas, escolha uma:
 import os
 import csv
 import io
+import functools
 from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import OperationalError, DBAPIError
 
 
 def _pegar_secret(nome, default=None):
@@ -45,6 +47,24 @@ def _pegar_secret(nome, default=None):
         return st.secrets.get(nome, default)
     except Exception:
         return default
+
+
+def _com_reconexao(func):
+    """Se a conexão com o banco cair no meio de uma consulta (comum em
+    bancos gratuitos, que fecham conexões paradas por um tempo), descarta
+    as conexões antigas e tenta de novo uma vez, em vez de quebrar a tela
+    direto."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except (OperationalError, DBAPIError):
+            try:
+                get_engine().dispose()
+            except Exception:
+                pass
+            return func(*args, **kwargs)
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +101,10 @@ def get_engine():
             "(Streamlit Community Cloud)."
         )
     return create_engine(
-        db_url, pool_pre_ping=True, pool_recycle=300,
+        db_url, pool_pre_ping=True, pool_recycle=180, pool_size=3, max_overflow=2,
         # importações grandes (dezenas de milhares de linhas) podem levar mais
         # que o padrão do Supabase — pede um limite de tempo maior por comando.
-        connect_args={"options": "-c statement_timeout=120000"},
+        connect_args={"options": "-c statement_timeout=120000", "connect_timeout": 10},
     )
 
 
@@ -462,6 +482,74 @@ def upsert_notas(df: pd.DataFrame) -> int:
     return len(registros)
 
 
+def _upsert_notas_parcial(df: pd.DataFrame, colunas: list) -> int:
+    """Upsert em notas tocando só as colunas passadas (além de DATA/CURRAL),
+    sem mexer nos outros campos já gravados pra aquele dia/curral (ex.:
+    importar só Chuva/Temperatura não deve apagar Troca de Dieta que já
+    estava lá, e vice-versa)."""
+    engine = get_engine()
+    todas_colunas = ["DATA", "CURRAL"] + colunas
+    cols_sql = ", ".join(f'"{c}"' for c in todas_colunas)
+    placeholders = ", ".join(f":{c}" for c in todas_colunas)
+    update_sql = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in colunas)
+    sql = text(
+        f'INSERT INTO notas ({cols_sql}) VALUES ({placeholders}) '
+        f'ON CONFLICT ("DATA", "CURRAL") DO UPDATE SET {update_sql}'
+    )
+    registros = []
+    for r in df.to_dict("records"):
+        row = {"DATA": _to_date(r.get("DATA")), "CURRAL": r.get("CURRAL")}
+        for c in colunas:
+            v = r.get(c)
+            # cobre NaN, NaT e None de uma vez — evita o caso em que um valor
+            # numérico vazio vira "NaT" por engano (acontece quando a linha
+            # de origem mistura uma coluna de data com colunas de número).
+            try:
+                if pd.isna(v):
+                    v = None
+            except (TypeError, ValueError):
+                pass
+            row[c] = v
+        registros.append(row)
+    if registros:
+        _executar_em_lotes(engine, sql, registros)
+    return len(registros)
+
+
+def importar_temperatura_chuva(df: pd.DataFrame, currais: list) -> int:
+    """df tem colunas DATA, CHUVA, T_MIN, T_MAX (sem Curral, já que
+    temperatura/chuva vale pra fazenda inteira) — aplica os valores de cada
+    dia pra TODOS os currais informados."""
+    linhas = []
+    for r in df.to_dict("records"):
+        for curral in currais:
+            linhas.append({
+                "DATA": r.get("DATA"), "CURRAL": curral,
+                "CHUVA": r.get("CHUVA"), "T_MIN": r.get("T_MIN"), "T_MAX": r.get("T_MAX"),
+            })
+    return _upsert_notas_parcial(pd.DataFrame(linhas), ["CHUVA", "T_MIN", "T_MAX"])
+
+
+def importar_ocorrencias(df: pd.DataFrame, currais: list = None) -> int:
+    """df tem colunas DATA, (opcional) CURRAL, FALTA_AGUA, EQUIPAMENTOS,
+    TROCA_DIETA. Se `currais` vier preenchido, ignora a coluna Curral da
+    planilha e aplica cada linha pra TODOS os currais da lista (opção
+    "jogar pra todos"). Se `currais` for None, usa a coluna Curral da
+    própria planilha, linha por linha (opção "por curral individual")."""
+    linhas = []
+    for r in df.to_dict("records"):
+        alvo_currais = currais if currais is not None else [r.get("CURRAL")]
+        for curral in alvo_currais:
+            if not curral:
+                continue
+            linhas.append({
+                "DATA": r.get("DATA"), "CURRAL": curral,
+                "FALTA_AGUA": r.get("FALTA_AGUA"), "EQUIPAMENTOS": r.get("EQUIPAMENTOS"),
+                "TROCA_DIETA": r.get("TROCA_DIETA"),
+            })
+    return _upsert_notas_parcial(pd.DataFrame(linhas), ["FALTA_AGUA", "EQUIPAMENTOS", "TROCA_DIETA"])
+
+
 # ---------------------------------------------------------------------------
 # Leitura (SELECT)
 # ---------------------------------------------------------------------------
@@ -472,6 +560,7 @@ JANELA_PADRAO_DIAS = 210  # ~7 meses — cobre o ciclo normal de confinamento;
 
 
 @st.cache_data(ttl=1800, show_spinner="Carregando histórico de Consumo...")
+@_com_reconexao
 def load_all_ativos(dias: int = JANELA_PADRAO_DIAS) -> pd.DataFrame:
     """Carrega o Consumo dos últimos `dias` dias (não a tabela inteira desde
     o começo) — isso reduz bastante o tráfego de dados trocado com o banco
@@ -492,6 +581,7 @@ def load_all_ativos(dias: int = JANELA_PADRAO_DIAS) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner="Carregando histórico de Leitura...")
+@_com_reconexao
 def load_all_leitura(dias: int = JANELA_PADRAO_DIAS) -> pd.DataFrame:
     engine = get_engine()
     query = 'SELECT * FROM leitura'
@@ -506,16 +596,37 @@ def load_all_leitura(dias: int = JANELA_PADRAO_DIAS) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_historico_completo_lote(curral: str, lote: int) -> pd.DataFrame:
-    """Busca TODO o histórico (sem limite de data) de um curral/lote
-    específico — uma consulta pequena e direcionada, usada só quando
-    realmente precisa (ex.: período 'Tudo' selecionado, ou a conta de
-    Sem/Com Limpeza que procura o %MS da dieta em qualquer data antiga).
-    Bem mais barata em tráfego do que carregar a tabela inteira."""
+@_com_reconexao
+def load_trechos_lotes() -> pd.DataFrame:
+    """Para cada lote Cargill, os currais por onde passou, com a primeira e
+    a última data em cada um (ordenados pela primeira aparição). Uma única
+    consulta pequena, carregada junto com o resto — assim trocar de
+    lote/curral não gera consulta nova."""
     engine = get_engine()
     df = pd.read_sql_query(
-        text('SELECT * FROM ativos WHERE "CURRAL" = :curral AND "LOTE" = :lote ORDER BY "DATA"'),
-        engine, params={"curral": curral, "lote": int(lote)},
+        text(
+            'SELECT "LOTE", "CURRAL", MIN("DATA") AS "INICIO", MAX("DATA") AS "FIM" '
+            'FROM ativos GROUP BY "LOTE", "CURRAL" ORDER BY "LOTE", MIN("DATA"), "CURRAL"'
+        ),
+        engine,
+    )
+    if not df.empty:
+        df["INICIO"] = pd.to_datetime(df["INICIO"])
+        df["FIM"] = pd.to_datetime(df["FIM"])
+    return df
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+@_com_reconexao
+def load_historico_completo_lote(lote: int) -> pd.DataFrame:
+    """Busca TODO o histórico (sem limite de data) de um lote Cargill,
+    em qualquer curral por onde ele tenha passado — uma consulta pequena e
+    direcionada, usada só quando realmente precisa (ex.: período 'Tudo', ou
+    a conta de Sem/Com Limpeza que procura o %MS da dieta em data antiga)."""
+    engine = get_engine()
+    df = pd.read_sql_query(
+        text('SELECT * FROM ativos WHERE "LOTE" = :lote ORDER BY "DATA"'),
+        engine, params={"lote": int(lote)},
     )
     if not df.empty:
         df["DATA"] = pd.to_datetime(df["DATA"])
@@ -524,6 +635,7 @@ def load_historico_completo_lote(curral: str, lote: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+@_com_reconexao
 def load_notas(curral: str) -> pd.DataFrame:
     engine = get_engine()
     df = pd.read_sql_query(
@@ -535,6 +647,7 @@ def load_notas(curral: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner="Carregando notas/ocorrências...")
+@_com_reconexao
 def load_all_notas() -> pd.DataFrame:
     """Carrega a tabela notas inteira de uma vez (todos os currais). Usar
     essa versão + filtrar em pandas é bem mais rápido do que chamar
@@ -714,6 +827,7 @@ def _add_consumo_previsto(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner="Carregando decisões...")
+@_com_reconexao
 def load_all_decisoes_raw() -> pd.DataFrame:
     """Carrega só a tabela decisoes (sem o JOIN caro com ativos), de uma vez
     só, pra todos os currais/lotes. Combine com calcular_consumo_previsto_local
@@ -749,6 +863,7 @@ def calcular_consumo_previsto_local(decisoes_df: pd.DataFrame, ativos_df: pd.Dat
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+@_com_reconexao
 def load_decisoes(curral: str = None, lote: int = None) -> pd.DataFrame:
     engine = get_engine()
     query = (
@@ -774,6 +889,7 @@ def load_decisoes(curral: str = None, lote: int = None) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
+@_com_reconexao
 def load_all_decisoes() -> pd.DataFrame:
     engine = get_engine()
     query = (

@@ -166,6 +166,42 @@ button[kind="primary"] p {{ font-weight: 800 !important; }}
     font-size: 18px !important; font-weight: 800 !important; color: {TEAL_DARK} !important;
     text-align: center !important;
 }}
+
+/* --- Botão de abrir/fechar a barra lateral: bem mais visível --- */
+[data-testid="stSidebarCollapseButton"],
+[data-testid="stExpandSidebarButton"] {{
+    background: {TEAL_DARK} !important;
+    border-radius: 12px !important;
+    padding: 6px !important;
+    box-shadow: 0 3px 10px rgba(0,0,0,0.35) !important;
+    position: relative !important;
+    min-width: 58px !important;
+    min-height: 58px !important;
+}}
+[data-testid="stSidebarCollapseButton"] button {{
+    width: 58px !important;
+    height: 58px !important;
+    position: relative !important;
+}}
+[data-testid="stSidebarCollapseButton"] button svg {{
+    display: none !important;
+}}
+[data-testid="stExpandSidebarButton"] [data-testid="stIconMaterial"] {{
+    visibility: hidden !important;
+}}
+[data-testid="stSidebarCollapseButton"] button::after,
+[data-testid="stExpandSidebarButton"]::after {{
+    content: "☰";
+    font-size: 34px;
+    font-weight: 900;
+    color: white;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    line-height: 1;
+}}
 .st-key-editar_leitura_wrap [data-testid="stCaptionContainer"] p,
 .st-key-registrar_ocorrencias_wrap [data-testid="stCaptionContainer"] p {{
     font-size: 18px !important;
@@ -406,6 +442,7 @@ ativos = db.load_all_ativos()
 leitura = db.load_all_leitura()
 todas_notas = db.load_all_notas()
 todas_decisoes_raw = db.load_all_decisoes_raw()
+trechos_lotes = db.load_trechos_lotes()
 
 if ativos.empty:
     st.markdown(f"""
@@ -586,6 +623,61 @@ with st.sidebar.expander("📥 Importar histórico de Decisões"):
             except Exception as e:
                 st.error(f"Erro ao importar: {e}")
 
+with st.sidebar.expander("🌡️ Importar Temperatura e Chuva (todos os currais)"):
+    st.caption(
+        "Planilha com colunas Data, Chuva (mm), T Mín e T Máx — um valor por "
+        "dia, sem coluna de Curral (esses dados valem pra fazenda inteira). "
+        "Ao importar, aplica automaticamente pra **todos os currais**."
+    )
+    up_temp_chuva = st.file_uploader(
+        "Planilha de Temperatura e Chuva", type=["xlsx"], key="up_temp_chuva"
+    )
+    if st.button("🌡️ Importar (aplica a todos os currais)", key="btn_importar_temp_chuva", width="stretch"):
+        if up_temp_chuva is None:
+            st.warning("Selecione o arquivo antes de importar.")
+        else:
+            try:
+                df_temp = importer.read_temperatura_chuva(up_temp_chuva)
+                n_temp = db.importar_temperatura_chuva(df_temp, currais)
+                st.cache_data.clear()
+                st.success(f"{n_temp} registro(s) de Temperatura/Chuva aplicados para {len(currais)} currais.")
+            except Exception as e:
+                st.error(f"Erro ao importar: {e}")
+
+with st.sidebar.expander("🔧 Importar Ocorrências (Dieta, Equipamentos, Água)"):
+    st.caption(
+        "Planilha com colunas Data, Curral, Troca de Dieta, Equipamentos e "
+        "Falta de Água. Escolha abaixo se quer aplicar pra **todos os "
+        "currais** (ignora a coluna Curral da planilha) ou **só pelos "
+        "currais que estiverem na própria planilha** (importação individual)."
+    )
+    up_ocorrencias = st.file_uploader(
+        "Planilha de Ocorrências", type=["xlsx"], key="up_ocorrencias"
+    )
+    col_ocorr_a, col_ocorr_b = st.columns(2)
+    if col_ocorr_a.button("🔧 Para TODOS os currais", key="btn_importar_ocorrencias_todos", width="stretch"):
+        if up_ocorrencias is None:
+            st.warning("Selecione o arquivo antes de importar.")
+        else:
+            try:
+                df_ocorr = importer.read_ocorrencias(up_ocorrencias)
+                n_ocorr = db.importar_ocorrencias(df_ocorr, currais=currais)
+                st.cache_data.clear()
+                st.success(f"{n_ocorr} registro(s) aplicados para {len(currais)} currais.")
+            except Exception as e:
+                st.error(f"Erro ao importar: {e}")
+    if col_ocorr_b.button("🔧 Por curral (usa a planilha)", key="btn_importar_ocorrencias_individual", width="stretch"):
+        if up_ocorrencias is None:
+            st.warning("Selecione o arquivo antes de importar.")
+        else:
+            try:
+                df_ocorr = importer.read_ocorrencias(up_ocorrencias)
+                n_ocorr = db.importar_ocorrencias(df_ocorr, currais=None)
+                st.cache_data.clear()
+                st.success(f"{n_ocorr} registro(s) importados, cada um só para o curral indicado na planilha.")
+            except Exception as e:
+                st.error(f"Erro ao importar: {e}")
+
 with st.sidebar.expander("🗑️ Excluir decisões de uma data"):
     st.caption("Remove as decisões de TODOS os currais/lotes numa data — útil pra limpar testes.")
     data_excluir_decisoes = st.date_input("Data das decisões a excluir", key="data_excluir_decisoes")
@@ -610,21 +702,58 @@ with st.sidebar.expander("🗑️ Excluir decisões de uma data"):
 # Monta a linha do tempo do curral/lote selecionado
 # ---------------------------------------------------------------------------
 
-sub_a = ativos[(ativos["CURRAL"] == sel_curral) & (ativos["LOTE"] == sel_lote)].sort_values("DATA").copy()
+# O histórico segue o LOTE Cargill. A tela continua ancorada no curral
+# selecionado (os dias do lote nele, como sempre) e, ANTES da data em que o
+# lote chegou nesse curral, puxa também os dias que ele teve em outros
+# currais — assim o histórico não "zera" quando os animais mudam de curral.
+# (Lote dividido em 2 currais ao mesmo tempo continua separado: cada curral
+# mostra o seu próprio consumo.)
 if periodo == "Tudo":
-    # o "ativos" carregado é só uma janela recente (poupa tráfego de dados
-    # com o Supabase) — quando o período escolhido é "Tudo", busca à parte
-    # o histórico completo SÓ deste lote (consulta pequena e direcionada).
-    sub_a = db.load_historico_completo_lote(sel_curral, sel_lote)
-sub_l = leitura[leitura["CURRAL"] == sel_curral].sort_values("DATA").copy()
-notas = notas_curral_atual  # já buscado mais acima, pro mesmo curral — evita consulta repetida
+    # o "ativos" carregado é só uma janela recente (poupa tráfego com o
+    # Supabase) — no período "Tudo", busca à parte o histórico completo
+    # deste lote (consulta pequena e direcionada).
+    _ativos_lote = db.load_historico_completo_lote(sel_lote)
+else:
+    _ativos_lote = ativos[ativos["LOTE"] == sel_lote]
 
-# a Leitura é gravada por Curral (não por Lote). Para não misturar leituras de
-# um lote anterior que já passou por este mesmo curral, só consideramos
-# leituras a partir da data de entrada deste lote.
-if not sub_a.empty:
-    lote_start = sub_a["DATA"].min()
-    sub_l = sub_l[sub_l["DATA"] >= lote_start]
+_proprio = _ativos_lote[_ativos_lote["CURRAL"] == sel_curral]
+if _proprio.empty:
+    _anteriores = _ativos_lote.iloc[0:0]
+else:
+    _chegada = _proprio["DATA"].min()
+    _anteriores = _ativos_lote[(_ativos_lote["CURRAL"] != sel_curral) & (_ativos_lote["DATA"] < _chegada)]
+    # se em algum dia anterior o lote estava em 2 currais, fica com o de mais animais
+    _anteriores = (
+        _anteriores.sort_values(["DATA", "CAB"], ascending=[True, False])
+        .drop_duplicates(subset=["DATA"], keep="first")
+    )
+sub_a = pd.concat([_anteriores, _proprio]).sort_values("DATA").copy()
+
+# Currais por onde o lote passou (para o card "Histórico de Currais").
+trechos_lote = trechos_lotes[trechos_lotes["LOTE"] == sel_lote].sort_values(["INICIO", "CURRAL"]).reset_index(drop=True) \
+    if not trechos_lotes.empty else trechos_lotes
+if trechos_lote.empty and not sub_a.empty:
+    trechos_lote = sub_a.groupby("CURRAL").agg(INICIO=("DATA", "min"), FIM=("DATA", "max")).reset_index()
+    trechos_lote.insert(0, "LOTE", sel_lote)
+    trechos_lote = trechos_lote.sort_values("INICIO").reset_index(drop=True)
+
+# A Leitura é gravada por CURRAL: nos dias anteriores, pega a leitura do
+# curral onde o lote estava naquele dia; a partir da chegada no curral
+# selecionado, a leitura dele (inclusive dias com Leitura e sem Consumo).
+if not _proprio.empty:
+    _leit_proprio = leitura[(leitura["CURRAL"] == sel_curral) & (leitura["DATA"] >= _chegada)]
+    # Se outro lote assumiu este curral depois que o lote saiu, a leitura dali
+    # em diante é do outro lote: corta no último dia do lote neste curral.
+    _saida = _proprio["DATA"].max()
+    if not ativos[(ativos["CURRAL"] == sel_curral) & (ativos["LOTE"] != sel_lote) & (ativos["DATA"] > _saida)].empty:
+        _leit_proprio = _leit_proprio[_leit_proprio["DATA"] <= _saida]
+else:
+    _leit_proprio = leitura.iloc[0:0]
+_leit_anterior = leitura.merge(_anteriores[["DATA", "CURRAL"]], on=["DATA", "CURRAL"], how="inner") \
+    if not _anteriores.empty else leitura.iloc[0:0]
+sub_l = pd.concat([_leit_anterior, _leit_proprio]).sort_values("DATA").copy()
+_currais_na_tela = sub_a["CURRAL"].dropna().unique().tolist() or [sel_curral]
+notas = todas_notas[todas_notas["CURRAL"].isin(_currais_na_tela)] if not todas_notas.empty else todas_notas
 
 # outer join: garante que um dia com Leitura mas ainda sem Consumo importado
 # (ou vice-versa) apareça mesmo assim no histórico.
@@ -802,7 +931,7 @@ tl["MS_DIETA_PCT"] = (tl["CONSUMO_MS"] / tl["CONSUMO_MN"].replace(0, np.nan)).ff
 
 # --- Diferença Ocorrida e Desvio Trato ---
 # Diferença Ocorrida(D) = CMS real de D - CMS real de D-1
-# Desvio Trato(D)        = Ajuste Planejado(D) - Diferença Ocorrida(D)
+# Desvio Trato(D)        = Diferença Ocorrida(D) - Ajuste Planejado(D)
 _cms_por_data = tl.set_index("DATA")["CONSUMO_MS"]
 _decisoes_lote_bruto = todas_decisoes_raw[
     (todas_decisoes_raw["CURRAL"] == sel_curral) & (todas_decisoes_raw["LOTE"] == sel_lote)
@@ -819,7 +948,7 @@ def _diferenca_ocorrida(row):
 
 
 tl["DIFERENCA_OCORRIDA"] = tl.apply(_diferenca_ocorrida, axis=1)
-tl["DESVIO_TRATO_CALC"] = tl["AJUSTE_KG_1"] - tl["DIFERENCA_OCORRIDA"]
+tl["DESVIO_TRATO_CALC"] = tl["DIFERENCA_OCORRIDA"] - tl["AJUSTE_KG_1"]
 
 # ---------------------------------------------------------------------------
 # Funções auxiliares da tabela (usadas no mini-histórico e no histórico completo)
@@ -1006,7 +1135,7 @@ with st.container(key="header_container"):
 col_left, col_right = st.columns([2.6, 0.55])
 
 with col_left:
-    mc = st.columns(6)
+    mc = st.columns([1, 1, 1, 1, 1, 1, 1.5])
 
     def metric(col, label, value, small=False):
         cls = "value small" if small else "value"
@@ -1026,6 +1155,25 @@ with col_left:
     metric(mc[3], "Peso Atual", f'{last["PESO_MEDIO_ATUAL"]:.0f} kg' if pd.notna(last["PESO_MEDIO_ATUAL"]) else "-")
     metric(mc[4], "Raça", last["RACA"] if pd.notna(last["RACA"]) else "-")
     metric(mc[5], "Dias de Cocho", int(last["DIAS_CONF"]) if pd.notna(last["DIAS_CONF"]) else "-")
+
+    # Histórico de currais: por onde este lote Cargill passou, em ordem de chegada.
+    if trechos_lote.empty:
+        _hist_html, _hist_dicas = "-", ""
+    else:
+        _partes = [
+            f'<b style="color:{TEAL_DARK};">{_t["CURRAL"]}</b>' if _t["CURRAL"] == sel_curral else f'{_t["CURRAL"]}'
+            for _, _t in trechos_lote.iterrows()
+        ]
+        _hist_html = " → ".join(_partes)
+        _hist_dicas = " | ".join(
+            f'{_t["CURRAL"]}: {_t["INICIO"].strftime("%d/%m/%Y")} a {_t["FIM"].strftime("%d/%m/%Y")}'
+            for _, _t in trechos_lote.iterrows()
+        )
+    mc[6].markdown(
+        f'<div class="metric-card" title="{_hist_dicas}"><div class="label">Histórico de Currais</div>'
+        f'<div class="value small">{_hist_html}</div></div>',
+        unsafe_allow_html=True,
+    )
 
     # legenda das fases de dieta (cores usadas nas barras do gráfico)
     _legenda_html = "".join(
@@ -1124,8 +1272,8 @@ with col_left:
         "Linhas **Escore 18:00**, **Escore 12:00** e **Escore 16:00** foram adicionadas conforme solicitado "
         "(ficam em branco até a planilha de Leitura trazer essas colunas). "
         "'% Leitura Desejada' considera desejável: 20h=S, 00h=S, 03h=S e 06h=Crumbs ou Dry. "
-        "**Diferença Ocorrida** = CMS de hoje − CMS de ontem. **Desvio Trato** = Ajuste Planejado − "
-        "Diferença Ocorrida. "
+        "**Diferença Ocorrida** = CMS de hoje − CMS de ontem. **Desvio Trato** = Diferença Ocorrida − "
+        "Ajuste Planejado. "
         "Marque a caixa acima para ver o detalhe de cada ocorrência; desmarcada, elas somam em uma "
         "única linha 'Ocorrências' com a contagem do dia."
     )
@@ -1305,9 +1453,11 @@ with col_right:
         # recente carregada), pra não falhar se o dado válido estiver mais
         # antigo, ou se faltar CONSUMO_MN nos dias recentes. Consulta pequena
         # e direcionada (só esse lote), não a tabela inteira.
-        hist_lote = db.load_historico_completo_lote(sel_curral, sel_lote)
+        hist_lote = db.load_historico_completo_lote(sel_lote)
         hist_lote["_MS_RATIO"] = hist_lote["CONSUMO_MS"] / hist_lote["CONSUMO_MN"].replace(0, np.nan)
-        validos = hist_lote.dropna(subset=["_MS_RATIO"])
+        validos = hist_lote[hist_lote["CURRAL"] == sel_curral].dropna(subset=["_MS_RATIO"])
+        if validos.empty:
+            validos = hist_lote.dropna(subset=["_MS_RATIO"])
         if not validos.empty:
             anteriores = validos[validos["DATA"] <= r_ref["DATA"]]
             linha_ratio = anteriores.iloc[-1] if not anteriores.empty else validos.iloc[-1]
@@ -1379,7 +1529,7 @@ with st.container(key="editar_leitura_wrap"):
             v = str(v)
             return v if v in opcoes else "-"
 
-        _linhas_leitura = tl[["DATA", "H18", "H20", "H00", "H03", "H06", "SOBRA", "H12", "H16"]].copy()
+        _linhas_leitura = tl[["DATA", "CURRAL", "H18", "H20", "H00", "H03", "H06", "SOBRA", "H12", "H16"]].copy()
 
         _larguras = [1.1, 0.8, 0.8, 0.8, 0.8, 1.1, 1, 1, 1]
         _cabecalho = st.columns(_larguras)
@@ -1389,6 +1539,7 @@ with st.container(key="editar_leitura_wrap"):
             _c.markdown(f'<div class="leitura-col-header">{_titulo}</div>', unsafe_allow_html=True)
 
         _valores_leitura = {}
+        _curral_por_data = {r["DATA"].strftime("%Y-%m-%d"): r["CURRAL"] for _, r in _linhas_leitura.iterrows()}
         for _, _row in _linhas_leitura.iterrows():
             _data_iso = _row["DATA"].strftime("%Y-%m-%d")
             _data_br = _row["DATA"].strftime("%d/%m")
@@ -1396,35 +1547,35 @@ with st.container(key="editar_leitura_wrap"):
             _cols[0].markdown(f'<div class="leitura-data-label">{_data_br}</div>', unsafe_allow_html=True)
             _h18 = _cols[1].selectbox(
                 "18h", _OPCOES_SN, index=_OPCOES_SN.index(_valor_opcao(_row["H18"], _OPCOES_SN)),
-                key=f"ed_h18_{_data_iso}", label_visibility="collapsed",
+                key=f"ed_h18_{sel_curral}_{sel_lote}_{_data_iso}", label_visibility="collapsed",
             )
             _h20 = _cols[2].selectbox(
                 "20h", _OPCOES_SN, index=_OPCOES_SN.index(_valor_opcao(_row["H20"], _OPCOES_SN)),
-                key=f"ed_h20_{_data_iso}", label_visibility="collapsed",
+                key=f"ed_h20_{sel_curral}_{sel_lote}_{_data_iso}", label_visibility="collapsed",
             )
             _h00 = _cols[3].selectbox(
                 "00h", _OPCOES_SN, index=_OPCOES_SN.index(_valor_opcao(_row["H00"], _OPCOES_SN)),
-                key=f"ed_h00_{_data_iso}", label_visibility="collapsed",
+                key=f"ed_h00_{sel_curral}_{sel_lote}_{_data_iso}", label_visibility="collapsed",
             )
             _h03 = _cols[4].selectbox(
                 "03h", _OPCOES_SN, index=_OPCOES_SN.index(_valor_opcao(_row["H03"], _OPCOES_SN)),
-                key=f"ed_h03_{_data_iso}", label_visibility="collapsed",
+                key=f"ed_h03_{sel_curral}_{sel_lote}_{_data_iso}", label_visibility="collapsed",
             )
             _h06 = _cols[5].selectbox(
                 "06h", _OPCOES_H06, index=_OPCOES_H06.index(_valor_opcao(_row["H06"], _OPCOES_H06)),
-                key=f"ed_h06_{_data_iso}", label_visibility="collapsed",
+                key=f"ed_h06_{sel_curral}_{sel_lote}_{_data_iso}", label_visibility="collapsed",
             )
             _sobra = _cols[6].number_input(
                 "Sobra", value=float(_row["SOBRA"]) if pd.notna(_row["SOBRA"]) else None,
-                step=1.0, format="%.0f", key=f"ed_sobra_{_data_iso}", label_visibility="collapsed",
+                step=1.0, format="%.0f", key=f"ed_sobra_{sel_curral}_{sel_lote}_{_data_iso}", label_visibility="collapsed",
             )
             _h12 = _cols[7].selectbox(
                 "12h", _OPCOES_SN, index=_OPCOES_SN.index(_valor_opcao(_row["H12"], _OPCOES_SN)),
-                key=f"ed_h12_{_data_iso}", label_visibility="collapsed",
+                key=f"ed_h12_{sel_curral}_{sel_lote}_{_data_iso}", label_visibility="collapsed",
             )
             _h16 = _cols[8].number_input(
                 "16h", value=float(_row["H16"]) if pd.notna(_row["H16"]) else None,
-                step=1.0, format="%.0f", key=f"ed_h16_{_data_iso}", label_visibility="collapsed",
+                step=1.0, format="%.0f", key=f"ed_h16_{sel_curral}_{sel_lote}_{_data_iso}", label_visibility="collapsed",
             )
             _valores_leitura[_data_iso] = {
                 "H18": None if _h18 == "-" else _h18, "H20": None if _h20 == "-" else _h20,
@@ -1436,7 +1587,7 @@ with st.container(key="editar_leitura_wrap"):
         if st.button("💾 Salvar Leitura editada", key="btn_salvar_leitura_editada"):
             registros_editados = []
             for _data_iso, _vals in _valores_leitura.items():
-                registros_editados.append({"DATA": _data_iso, "CURRAL": sel_curral, **_vals})
+                registros_editados.append({"DATA": _data_iso, "CURRAL": _curral_por_data.get(_data_iso, sel_curral), **_vals})
             save_leitura_df = pd.DataFrame(registros_editados)
             n_leitura = db.upsert_leitura_manual(save_leitura_df)
             st.success(f"{n_leitura} dia(s) de Leitura salvos para o curral {sel_curral}.")
@@ -1450,7 +1601,8 @@ with st.container(key="registrar_ocorrencias_wrap"):
         edited = st.data_editor(edit_df, hide_index=True, width="stretch", key="notas_editor")
         if st.button("💾 Salvar ocorrências", key="btn_salvar_ocorrencias"):
             save_df = edited.copy()
-            save_df["CURRAL"] = sel_curral
+            _mapa_curral = {r["DATA"].strftime("%Y-%m-%d"): r["CURRAL"] for _, r in tl.iterrows()}
+            save_df["CURRAL"] = save_df["DATA"].map(_mapa_curral).fillna(sel_curral)
             save_df["LIMPOU"] = None
             n = db.upsert_notas(save_df)
             st.success(f"{n} dias salvos para o curral {sel_curral}.")
